@@ -132,6 +132,16 @@ static bool IsPageAligned(const void* ptr) {
 }
 #endif
 
+static void
+ShmName(std::string fname, char *shm_name)
+{
+  char *p;
+  sprintf(shm_name, "%s.shm", fname.c_str());
+  while ((p = strchr(shm_name, '/')) != NULL) {
+    *p = '_';
+  }
+}
+
 /*
  * PosixSequentialFile
  */
@@ -143,6 +153,24 @@ PosixSequentialFile::PosixSequentialFile(const std::string& fname, FILE* file,
       use_direct_io_(options.use_direct_reads),
       logical_sector_size_(GetLogicalBufferSize(fd_)) {
   assert(!options.use_direct_reads || !options.use_mmap_reads);
+  if (fname.rfind(".log") != std::string::npos) {
+    char shm_name[fname.size() + 5];
+    int shm_fd;
+    ShmName(fname, shm_name);
+    shm_fd = shm_open(shm_name, O_RDONLY, 0666);
+    if (shm_fd >= 0) {
+      // re-adjust the file length down to the last known good offset
+      off_t offset;
+      ssize_t rval = pread(shm_fd, &offset, sizeof(offset), 0);
+      if (rval == sizeof(offset)) {
+        if (truncate(fname.c_str(), offset)) {
+          IOError("truncate failed", errno);
+        }
+      }
+      close(shm_fd);
+      shm_unlink(shm_name);
+    }
+  }
 }
 
 PosixSequentialFile::~PosixSequentialFile() {
@@ -857,6 +885,173 @@ size_t PosixWritableFile::GetUniqueId(char* id, size_t max_size) const {
 }
 #endif
 
+/*
+ * WALWritableFile
+ */
+WALWritableFile::WALWritableFile(const std::string& fname, int fd,
+                                 const EnvOptions& options)
+  : filename_(fname),
+    fd_(fd),
+    shm_fd_(-1),
+    dirty_(false),
+    len_(0),
+    off_(0),
+    cache_(reinterpret_cast<char*>(roundup(reinterpret_cast<uintptr_t>(cache_buf_), 4096))) {
+  char shm_name[fname.size() + 5];
+  ShmName(fname, shm_name);
+  shm_fd_ = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+  if (shm_fd_ < 0) {
+    IOError(shm_name, errno);
+    return;
+  }
+}
+
+WALWritableFile::~WALWritableFile() {
+  if (fd_ >= 0) {
+    Close();
+  }
+}
+
+Status WALWritableFile::Truncate(uint64_t size)
+{
+  if (ftruncate(fd_, size)) {
+    return IOError(filename_, errno);
+  }
+  if (fsync(fd_)) {
+    return IOError(filename_, errno);
+  }
+  return Status::OK();
+}
+
+Status WALWritableFile::Close()
+{
+  Status s;
+  if (dirty_) {
+    s = Sync();
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  if (ftruncate(fd_, off_ + len_)) {
+    return IOError(filename_, errno);
+  }
+  if (fsync(fd_)) {
+    return IOError(filename_, errno);
+  }
+  close(fd_);
+  fd_ = -1;
+
+  if (shm_fd_ >= 0) {
+    char shm_name[filename_.size() + 5];
+    close(shm_fd_);
+    shm_fd_ = -1;
+    ShmName(filename_, shm_name);
+    shm_unlink(shm_name);
+  }
+  return Status::OK();
+}
+
+Status WALWritableFile::Append(const Slice& data)
+{
+  const char *src = data.data();
+  size_t left = data.size();
+
+  // make sure our writes don't cross rocksdb block boundaries,
+  // since we can't be guaranteed the entire write makes it out
+  // in one piece and in order.
+  if (len_ + left > bufsz_) {
+    Status s = Sync();
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  memcpy(cache_ + len_, src, left);
+  len_ += left;
+  dirty_ = true;
+  return Status::OK();
+}
+
+Status WALWritableFile::Flush() { return Status::OK(); }
+
+Status WALWritableFile::Sync()
+{
+  static const int sector_size = 512;
+  const char* src = cache_;
+  size_t left = roundup(len_, sector_size);
+  size_t remainder = len_ % sector_size;
+  off_t offset = off_;
+
+  if (!dirty_) {
+    return Status::OK();
+  }
+  if (left != len_) {
+    // zero out the tail
+    memset(cache_ + len_, 0, left - len_);
+  }
+  while (left != 0) {
+    ssize_t done = pwrite(fd_, src, left, offset);
+    if (done < 0) {
+      // error while writing to file
+      if (errno == EINTR) {
+        // write was interrupted, try again.
+        continue;
+      }
+      return IOError(filename_, errno);
+    }
+
+    // Wrote `done` bytes
+    left -= done;
+    offset += done;
+    src += done;
+    if (shm_fd_) {
+      // stash last good offset in shared memory
+      done = pwrite(shm_fd_, &offset, sizeof(offset), 0);
+      if (done < 0) {
+        IOError("shared mem update failed", errno);
+      }
+    }
+  }
+  fdatasync(fd_);
+  off_ = offset;
+
+  // shift what's left back to the front of the buffer
+  if (remainder) {
+    memmove(cache_, cache_ + len_ - remainder, remainder);
+    off_ -= sector_size;
+  }
+  len_ = remainder;
+  dirty_ = false;
+  return Status::OK();
+}
+
+uint64_t WALWritableFile::GetFileSize()
+{
+  return off_ + len_;
+}
+
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+Status WALWritableFile::Allocate(uint64_t offset, uint64_t len) {
+  assert(offset <= std::numeric_limits<off_t>::max());
+  assert(len <= std::numeric_limits<off_t>::max());
+  // fallocate() doesn't guarantee *all* the needed blocks are synced,
+  // so we painstakingly zero those blocks in advance to make sure any
+  // subsequent O_DIRECT pwrite()s need no additional meta-data blocks
+  // to be written.
+  uint64_t end = offset + len;
+  while (offset < end) {
+    static char zeros[1048576] __attribute__ ((aligned (4096)));
+    size_t nbytes = std::min(len, sizeof(zeros));
+    ssize_t rval = pwrite(fd_, zeros, nbytes, offset);
+    if (rval < 0) {
+      return IOError(filename_, errno);
+    }
+    offset += rval;
+    len -= rval;
+  }
+  fdatasync(fd_);
+  return Status::OK();
+}
+#endif
 /*
  * PosixRandomRWFile
  */

@@ -313,7 +313,11 @@ class PosixEnv : public Env {
         return s;
       }
 #endif
-      result->reset(new PosixWritableFile(fname, fd, options));
+      if (fname.rfind(".log") != std::string::npos) {
+        result->reset(new WALWritableFile(fname, fd, options));
+      } else {
+        result->reset(new PosixWritableFile(fname, fd, options));
+      }
     } else {
       // disable mmap writes
       EnvOptions no_mmap_writes_options = options;
@@ -391,7 +395,11 @@ class PosixEnv : public Env {
       // disable mmap writes
       EnvOptions no_mmap_writes_options = options;
       no_mmap_writes_options.use_mmap_writes = false;
-      result->reset(new PosixWritableFile(fname, fd, no_mmap_writes_options));
+      if (fname.rfind(".log") != std::string::npos) {
+        result->reset(new WALWritableFile(fname, fd, no_mmap_writes_options));
+      } else {
+        result->reset(new PosixWritableFile(fname, fd, no_mmap_writes_options));
+      }
     }
     return s;
 
@@ -767,12 +775,12 @@ class PosixEnv : public Env {
                                  const DBOptions& db_options) const override {
     EnvOptions optimized = env_options;
     optimized.use_mmap_writes = false;
-    optimized.use_direct_writes = false;
+    optimized.use_direct_writes = db_options.use_direct_wal_writes;
     optimized.bytes_per_sync = db_options.wal_bytes_per_sync;
     // TODO(icanadi) it's faster if fallocate_with_keep_size is false, but it
     // breaks TransactionLogIteratorStallAtLastRecord unit test. Fix the unit
     // test and make this false
-    optimized.fallocate_with_keep_size = true;
+    optimized.fallocate_with_keep_size = !db_options.use_direct_wal_writes;
     return optimized;
   }
 
